@@ -1,0 +1,42 @@
+name: Cloud Lab reaper (auto-destroy expired labs)
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write   # to start the destroy runs
+
+concurrency:
+  group: lab-reaper
+  cancel-in-progress: false
+
+jobs:
+  reap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Find expired labs and start destroy runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          url="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          if ! git ls-remote --exit-code --heads "$url" lab-registry >/dev/null 2>&1; then
+            echo "No lab registry yet: nothing to do."; exit 0
+          fi
+          git clone --quiet --depth 1 --branch lab-registry "$url" reg
+          now=$(date +%s); started=0
+          shopt -s nullglob
+          for f in reg/*.json; do
+            exp=$(jq -r .expires_epoch "$f"); name=$(jq -r .name "$f"); cloud=$(jq -r .cloud "$f"); region=$(jq -r .region "$f")
+            if [ "$exp" -le "$now" ]; then
+              echo "Expired: $cloud/$name (expired $(date -u -d "@$exp" +%FT%TZ)) -> destroying"
+              gh workflow run lab.yml --repo "$REPO" -f action=destroy -f cloud="$cloud" -f lab_name="$name" -f region="$region"
+              started=$((started+1))
+            fi
+          done
+          echo "Destroy runs started: $started" >> "$GITHUB_STEP_SUMMARY"

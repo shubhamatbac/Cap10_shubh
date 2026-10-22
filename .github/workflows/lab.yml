@@ -1,0 +1,244 @@
+name: Cloud Lab (create / destroy VMs)
+
+# Run from the GitHub UI: Actions -> "Cloud Lab" -> Run workflow, then pick the options.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "What to do"
+        type: choice
+        options: [create, destroy]
+        default: create
+      cloud:
+        description: "Cloud provider"
+        type: choice
+        options: [aws, azure, gcp]
+        default: aws
+      lab_name:
+        description: "Lab name (2-24 chars: lowercase letters, digits, hyphens)"
+        type: string
+        required: true
+      region:
+        description: "Region (leave 'default' for us-east-1 / eastus / us-central1)"
+        type: choice
+        options: [default, us-east-1, us-east-2, us-west-2, eu-west-1, ap-south-1, eastus, westeurope, centralindia, us-central1, europe-west1, asia-south1]
+        default: default
+      vm_count:
+        description: "Number of VMs"
+        type: choice
+        options: ["1", "2", "3", "4", "5"]
+        default: "1"
+      size:
+        description: "VM size (small ~1-2 GB RAM, medium ~2-4 GB, large ~4-8 GB)"
+        type: choice
+        options: [small, medium, large]
+        default: small
+      os:
+        description: "Operating system"
+        type: choice
+        options: [ubuntu-24.04, ubuntu-22.04]
+        default: ubuntu-24.04
+      disk_gb:
+        description: "Disk size per VM in GB (10-200)"
+        type: string
+        default: "20"
+      lifetime_hours:
+        description: "Auto-destroy after (hours)"
+        type: choice
+        options: ["1", "2", "4", "8", "24", "72"]
+        default: "4"
+      allowed_cidr:
+        description: "Your public IP as x.x.x.x/32, allowed to SSH (0.0.0.0/0 is rejected)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write   # lab registry branch
+  id-token: write   # OIDC login to the clouds (no stored cloud keys)
+
+concurrency:
+  group: lab-${{ inputs.cloud }}-${{ inputs.lab_name }}
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "1"
+
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Add required reviewers to these environments in repo Settings to gate billable runs.
+    environment: lab-${{ inputs.cloud }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs and compute settings
+        id: cfg
+        env:
+          CLOUD: ${{ inputs.cloud }}
+          ACTION: ${{ inputs.action }}
+          NAME: ${{ inputs.lab_name }}
+          REGION_IN: ${{ inputs.region }}
+          DISK: ${{ inputs.disk_gb }}
+          HOURS: ${{ inputs.lifetime_hours }}
+          CIDR: ${{ inputs.allowed_cidr }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          [[ "$NAME" =~ ^[a-z][a-z0-9-]{1,23}$ ]] || { echo "::error::lab_name must be 2-24 chars: lowercase letters, digits, hyphens, starting with a letter."; exit 1; }
+          [[ "$DISK" =~ ^[0-9]{2,3}$ ]] && [ "$DISK" -ge 10 ] && [ "$DISK" -le 200 ] || { echo "::error::disk_gb must be 10-200."; exit 1; }
+          if [ "$ACTION" = "create" ]; then
+            [[ "$CIDR" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]] || { echo "::error::allowed_cidr must be like 203.0.113.7/32."; exit 1; }
+            [ "$CIDR" != "0.0.0.0/0" ] || { echo "::error::0.0.0.0/0 is not allowed."; exit 1; }
+          else
+            CIDR="203.0.113.1/32"   # placeholder; unused when destroying
+          fi
+          case "$REGION_IN" in
+            default) case "$CLOUD" in aws) REGION=us-east-1;; azure) REGION=eastus;; gcp) REGION=us-central1;; esac ;;
+            *) REGION="$REGION_IN" ;;
+          esac
+          case "$CLOUD:$REGION" in
+            aws:us-*|aws:eu-*|aws:ap-*|azure:eastus|azure:westeurope|azure:centralindia|gcp:us-central1|gcp:europe-west1|gcp:asia-south1) ;;
+            *) echo "::error::Region $REGION does not belong to $CLOUD."; exit 1 ;;
+          esac
+          OWNER=$(echo "$ACTOR" | tr -c 'A-Za-z0-9_-' '-')
+          EXP_EPOCH=$(date -u -d "+${HOURS} hours" +%s)
+          {
+            echo "region=$REGION"
+            echo "cidr=$CIDR"
+            echo "owner=$OWNER"
+            echo "exp_epoch=$EXP_EPOCH"
+            echo "exp_iso=$(date -u -d "@$EXP_EPOCH" +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+      # ---------------- cloud login (OIDC, short-lived credentials)
+      - name: AWS login
+        if: inputs.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.TF_STATE_REGION || 'us-east-1' }}
+      - name: Azure login
+        if: inputs.cloud == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: GCP login
+        if: inputs.cloud == 'gcp'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      - name: Terraform init (remote state, one state per lab)
+        working-directory: terraform/vm/${{ inputs.cloud }}
+        env:
+          CLOUD: ${{ inputs.cloud }}
+          NAME: ${{ inputs.lab_name }}
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+          case "$CLOUD" in
+            aws)
+              terraform init -input=false \
+                -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+                -backend-config="region=${{ vars.TF_STATE_REGION || 'us-east-1' }}" \
+                -backend-config="key=labs/aws/${NAME}.tfstate" \
+                -backend-config="encrypt=true" \
+                -backend-config="use_lockfile=true" ;;
+            azure)
+              terraform init -input=false \
+                -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+                -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+                -backend-config="container_name=${{ vars.TF_STATE_CONTAINER || 'tfstate' }}" \
+                -backend-config="key=labs/azure/${NAME}.tfstate" \
+                -backend-config="use_oidc=true" \
+                -backend-config="use_azuread_auth=true" ;;
+            gcp)
+              terraform init -input=false \
+                -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+                -backend-config="prefix=labs/gcp/${NAME}" ;;
+          esac
+
+      - name: Terraform validate
+        working-directory: terraform/vm/${{ inputs.cloud }}
+        run: terraform validate -no-color
+
+      - name: Set Terraform variables
+        run: |
+          {
+            echo "TF_VAR_lab_name=${{ inputs.lab_name }}"
+            echo "TF_VAR_region=${{ steps.cfg.outputs.region }}"
+            echo "TF_VAR_size=${{ inputs.size }}"
+            echo "TF_VAR_os=${{ inputs.os }}"
+            echo "TF_VAR_vm_count=${{ inputs.vm_count }}"
+            echo "TF_VAR_disk_gb=${{ inputs.disk_gb }}"
+            echo "TF_VAR_allowed_cidr=${{ steps.cfg.outputs.cidr }}"
+            echo "TF_VAR_expires_at=${{ steps.cfg.outputs.exp_iso }}"
+            echo "TF_VAR_owner=${{ steps.cfg.outputs.owner }}"
+            echo "TF_VAR_project=${{ vars.GCP_PROJECT }}"
+            echo "TF_VAR_ssh_public_key=${{ vars.LAB_SSH_PUBLIC_KEY }}"
+          } >> "$GITHUB_ENV"
+
+      # ---------------- create
+      - name: Terraform plan
+        if: inputs.action == 'create'
+        working-directory: terraform/vm/${{ inputs.cloud }}
+        run: terraform plan -input=false -no-color -out=tfplan
+
+      - name: Terraform apply
+        if: inputs.action == 'create'
+        working-directory: terraform/vm/${{ inputs.cloud }}
+        run: terraform apply -input=false -no-color tfplan
+
+      - name: Register lab for auto-destroy
+        if: inputs.action == 'create'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          .github/scripts/registry.sh put "${{ inputs.lab_name }}" "${{ inputs.cloud }}" \
+            "${{ steps.cfg.outputs.region }}" "${{ steps.cfg.outputs.exp_epoch }}" "${{ steps.cfg.outputs.owner }}"
+
+      - name: Connection details
+        if: inputs.action == 'create'
+        working-directory: terraform/vm/${{ inputs.cloud }}
+        run: |
+          set -euo pipefail
+          SSH_USER=$(terraform output -raw ssh_user)
+          {
+            echo "## Lab \`${{ inputs.lab_name }}\` is running on ${{ inputs.cloud }}"
+            echo "Region: ${{ steps.cfg.outputs.region }} | VMs: ${{ inputs.vm_count }} | Size: ${{ inputs.size }} | OS: ${{ inputs.os }}"
+            echo "**Auto-destroys at ${{ steps.cfg.outputs.exp_iso }}** (checked every 15 minutes)."
+            echo
+            echo "| VM | Public IP | Private IP | SSH |"
+            echo "|---|---|---|---|"
+            terraform output -json vms | jq -r --arg u "$SSH_USER" '.[] | "| \(.name) | \(.public_ip) | \(.private_ip) | `ssh \($u)@\(.public_ip)` |"'
+            echo
+            echo "Use the private key matching the LAB_SSH_PUBLIC_KEY repository variable."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------- destroy
+      - name: Terraform destroy
+        if: inputs.action == 'destroy'
+        working-directory: terraform/vm/${{ inputs.cloud }}
+        run: terraform destroy -auto-approve -input=false -no-color
+
+      - name: Remove from registry
+        if: inputs.action == 'destroy'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: .github/scripts/registry.sh remove "${{ inputs.lab_name }}" "${{ inputs.cloud }}"
+
+      - name: Destroy summary
+        if: inputs.action == 'destroy'
+        run: echo "Lab \`${{ inputs.lab_name }}\` on ${{ inputs.cloud }} was destroyed." >> "$GITHUB_STEP_SUMMARY"
