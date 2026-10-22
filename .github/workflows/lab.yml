@@ -12,16 +12,16 @@ on:
       cloud:
         description: "Cloud provider"
         type: choice
-        options: [aws, azure, gcp]
+        options: [aws, azure, gcp, oci]
         default: aws
       lab_name:
         description: "Lab name (2-24 chars: lowercase letters, digits, hyphens)"
         type: string
         required: true
       region:
-        description: "Region (leave 'default' for us-east-1 / eastus / us-central1)"
+        description: "Region (leave 'default' for us-east-1 / eastus / us-central1 / us-ashburn-1)"
         type: choice
-        options: [default, us-east-1, us-east-2, us-west-2, eu-west-1, ap-south-1, eastus, westeurope, centralindia, us-central1, europe-west1, asia-south1]
+        options: [default, us-east-1, us-east-2, us-west-2, eu-west-1, ap-south-1, eastus, westeurope, centralindia, us-central1, europe-west1, asia-south1, us-ashburn-1, eu-frankfurt-1, ap-mumbai-1]
         default: default
       vm_count:
         description: "Number of VMs"
@@ -62,6 +62,12 @@ concurrency:
 
 env:
   TF_IN_AUTOMATION: "1"
+  # Oracle Cloud API-key login (ignored by the other clouds).
+  TF_VAR_tenancy_ocid: ${{ vars.OCI_TENANCY_OCID }}
+  TF_VAR_user_ocid: ${{ vars.OCI_USER_OCID }}
+  TF_VAR_compartment_ocid: ${{ vars.OCI_COMPARTMENT_OCID }}
+  TF_VAR_fingerprint: ${{ vars.OCI_FINGERPRINT }}
+  TF_VAR_private_key: ${{ secrets.OCI_PRIVATE_KEY }}
 
 jobs:
   lab:
@@ -94,11 +100,11 @@ jobs:
             CIDR="203.0.113.1/32"   # placeholder; unused when destroying
           fi
           case "$REGION_IN" in
-            default) case "$CLOUD" in aws) REGION=us-east-1;; azure) REGION=eastus;; gcp) REGION=us-central1;; esac ;;
+            default) case "$CLOUD" in aws) REGION=us-east-1;; azure) REGION=eastus;; gcp) REGION=us-central1;; oci) REGION=us-ashburn-1;; esac ;;
             *) REGION="$REGION_IN" ;;
           esac
           case "$CLOUD:$REGION" in
-            aws:us-*|aws:eu-*|aws:ap-*|azure:eastus|azure:westeurope|azure:centralindia|gcp:us-central1|gcp:europe-west1|gcp:asia-south1) ;;
+            aws:us-*|aws:eu-*|aws:ap-*|azure:eastus|azure:westeurope|azure:centralindia|gcp:us-central1|gcp:europe-west1|gcp:asia-south1|oci:us-ashburn-1|oci:eu-frankfurt-1|oci:ap-mumbai-1) ;;
             *) echo "::error::Region $REGION does not belong to $CLOUD."; exit 1 ;;
           esac
           OWNER=$(echo "$ACTOR" | tr -c 'A-Za-z0-9_-' '-')
@@ -146,6 +152,9 @@ jobs:
           ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
           ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
           ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          # OCI state bucket is reached through its S3-compatible API (Customer Secret Key).
+          AWS_ACCESS_KEY_ID: ${{ secrets.OCI_S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.OCI_S3_SECRET_KEY }}
         run: |
           set -euo pipefail
           case "$CLOUD" in
@@ -168,6 +177,18 @@ jobs:
               terraform init -input=false \
                 -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
                 -backend-config="prefix=labs/gcp/${NAME}" ;;
+            oci)
+              terraform init -input=false \
+                -backend-config="bucket=${{ vars.OCI_STATE_BUCKET }}" \
+                -backend-config="key=labs/oci/${NAME}.tfstate" \
+                -backend-config="region=${{ steps.cfg.outputs.region }}" \
+                -backend-config="endpoints={s3=\"https://${{ vars.OCI_NAMESPACE }}.compat.objectstorage.${{ steps.cfg.outputs.region }}.oraclecloud.com\"}" \
+                -backend-config="skip_region_validation=true" \
+                -backend-config="skip_credentials_validation=true" \
+                -backend-config="skip_requesting_account_id=true" \
+                -backend-config="skip_metadata_api_check=true" \
+                -backend-config="skip_s3_checksum=true" \
+                -backend-config="use_path_style=true" ;;
           esac
 
       - name: Terraform validate

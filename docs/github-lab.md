@@ -1,13 +1,13 @@
 # Cloud Lab from GitHub Actions
 
-Create temporary VMs on **AWS, Azure or GCP** straight from the GitHub UI. No server, no website, no third-party service.
+Create temporary VMs on **AWS, Azure, GCP or Oracle Cloud (OCI)** straight from the GitHub UI. No server, no website, no third-party service.
 
 **Use it:** repo -> **Actions** -> **Cloud Lab (create / destroy VMs)** -> **Run workflow**, then choose:
 
 | Option | Choices |
 |---|---|
 | action | create / destroy |
-| cloud | aws / azure / gcp |
+| cloud | aws / azure / gcp / oci |
 | lab_name | e.g. `demo1` (2-24 chars) |
 | region | default or a listed region |
 | vm_count | 1-5 |
@@ -19,11 +19,13 @@ Create temporary VMs on **AWS, Azure or GCP** straight from the GitHub UI. No se
 
 When the run finishes, the **run summary** shows each VM's IP and SSH command.
 
-| size | AWS | Azure | GCP |
-|---|---|---|---|
-| small | t3.micro | Standard_B1s | e2-micro |
-| medium | t3.small | Standard_B2s | e2-small |
-| large | t3.medium | Standard_B2ms | e2-medium |
+| size | AWS | Azure | GCP | OCI (VM.Standard.E4.Flex) |
+|---|---|---|---|---|
+| small | t3.micro | Standard_B1s | e2-micro | 1 OCPU, 4 GB |
+| medium | t3.small | Standard_B2s | e2-small | 2 OCPU, 8 GB |
+| large | t3.medium | Standard_B2ms | e2-medium | 4 OCPU, 16 GB |
+
+OCI boot disks are at least 50 GB, so smaller disk sizes are raised to 50.
 
 ## Auto-destroy
 After a create, the lab is recorded on an orphan branch `lab-registry` in this repo. The **Cloud Lab reaper** workflow runs every 15 minutes, finds expired labs and starts a `destroy` run for each. Nothing depends on your browser. GitHub cron can be delayed by several minutes, so destruction happens at expiry plus up to roughly 15-30 minutes. Check the cloud console for anything left over; a failed destroy run leaves resources running and billing.
@@ -39,6 +41,8 @@ Also create GitHub Environments named `lab-aws`, `lab-azure`, `lab-gcp` (no revi
 **Azure**: create a storage account + container for state and an app registration with a federated credential for `repo:<owner>/<repo>:environment:lab-azure`, role Contributor on the subscription. Variables: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `TF_STATE_RESOURCE_GROUP`, `TF_STATE_STORAGE_ACCOUNT`, `TF_STATE_CONTAINER` (default `tfstate`).
 
 **GCP**: create a GCS bucket for state, a service account (Compute Admin + bucket access) and Workload Identity Federation for this repo. Variables: `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_SERVICE_ACCOUNT`, `TF_STATE_BUCKET`, `GCP_PROJECT`.
+
+**OCI**: OCI uses an API key (not GitHub OIDC), so it needs secrets. Create an API signing key for a dedicated user in a group allowed to manage compute/network in one compartment, a bucket for state, and a Customer Secret Key (S3-compatible credentials) for that user. Variables: `OCI_TENANCY_OCID`, `OCI_USER_OCID`, `OCI_COMPARTMENT_OCID`, `OCI_FINGERPRINT`, `OCI_STATE_BUCKET`, `OCI_NAMESPACE` (Object Storage namespace). Secrets: `OCI_PRIVATE_KEY` (PEM contents), `OCI_S3_ACCESS_KEY`, `OCI_S3_SECRET_KEY`. Create the state bucket in the home region you will use; use environment `lab-oci`. Not Always-Free shapes: this costs money. State locking is not available on this backend; runs for the same lab are serialized by the workflow instead.
 
 ## Safety notes
 - SSH is open only to the CIDR you enter; inputs are validated before anything runs; size, count, disk and lifetime are capped.
