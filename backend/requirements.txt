@@ -1,0 +1,5 @@
+# Runtime dependencies (pinned to the versions this code was developed and tested with).
+starlette==1.7.0
+uvicorn==0.54.0
+pydantic==2.13.5
+PyJWT==2.15.0
