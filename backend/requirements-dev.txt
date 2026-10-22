@@ -1,0 +1,4 @@
+-r requirements.txt
+ruff==0.16.9
+mypy==2.3.1
+# Tests use only the standard library (unittest); pytest also runs them if installed.
